@@ -9,6 +9,34 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestRateLimitedResult(t *testing.T) {
+	const message = "DeepL returned HTTP 429 (Too Many Requests)"
+	tests := []struct {
+		body       string
+		retryAfter string
+		want       string
+	}{
+		{`{"message":"Try again later"}`, "60", message + ": Try again later"},
+		{`{"errors":[{"message":"Too many requests"}]}`, "", message + ": Too many requests"},
+		{`{"message":`, "", message},
+		{`<html>Too many requests</html>`, "", message},
+		{`{"message":{"reason":"unknown"}}`, "", message},
+	}
+	for _, tt := range tests {
+		response := oneshotResponse{
+			status:     http.StatusTooManyRequests,
+			body:       gjson.Parse(tt.body),
+			retryAfter: tt.retryAfter,
+		}
+		result := response.rateLimitedResult(123)
+		if result.Code != http.StatusTooManyRequests || result.ID != 123 ||
+			result.Message != tt.want || result.RetryAfter != tt.retryAfter {
+			t.Errorf("rateLimitedResult(%q) = %+v, want 429, ID 123, message %q, Retry-After %q",
+				tt.body, result, tt.want, tt.retryAfter)
+		}
+	}
+}
+
 func TestTextsToTranslate(t *testing.T) {
 	tests := []struct {
 		name      string

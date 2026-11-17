@@ -190,7 +190,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, texts, tagHandling, proxyURL, "")
+		result, err := translate.TranslateByDLXContext(c.Request.Context(), sourceLang, targetLang, texts, tagHandling, proxyURL, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -199,7 +199,6 @@ func Router(cfg *Config) *gin.Engine {
 			})
 			return
 		}
-
 		if result.Code == http.StatusOK {
 			response := gin.H{
 				"code":         http.StatusOK,
@@ -218,11 +217,7 @@ func Router(cfg *Config) *gin.Engine {
 			}
 			c.JSON(http.StatusOK, response)
 		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
-
+			respondTranslationError(c, result)
 		}
 	})
 
@@ -272,7 +267,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, []string{translateText}, tagHandling, proxyURL, dlSession)
+		result, err := translate.TranslateByDLXContext(c.Request.Context(), sourceLang, targetLang, []string{translateText}, tagHandling, proxyURL, dlSession)
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -293,11 +288,7 @@ func Router(cfg *Config) *gin.Engine {
 				"method":       result.Method,
 			})
 		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
-
+			respondTranslationError(c, result)
 		}
 	})
 
@@ -333,7 +324,7 @@ func Router(cfg *Config) *gin.Engine {
 			targetLang = jsonData.TargetLang
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, []string{translateText}, "", proxyURL, "")
+		result, err := translate.TranslateByDLXContext(c.Request.Context(), sourceLang, targetLang, []string{translateText}, "", proxyURL, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -353,10 +344,7 @@ func Router(cfg *Config) *gin.Engine {
 				},
 			})
 		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
+			respondTranslationError(c, result)
 		}
 	})
 
@@ -369,4 +357,14 @@ func Router(cfg *Config) *gin.Engine {
 	})
 
 	return r
+}
+
+func respondTranslationError(c *gin.Context, result translate.DLXTranslationResult) {
+	if result.RetryAfter != "" {
+		c.Header("Retry-After", result.RetryAfter)
+	}
+	c.JSON(result.Code, gin.H{
+		"code":    result.Code,
+		"message": result.Message,
+	})
 }

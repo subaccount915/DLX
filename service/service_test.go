@@ -8,8 +8,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/OwO-Network/DLX/translate"
 	"github.com/gin-gonic/gin"
 )
+
+func TestRespondTranslationErrorForwardsRetryAfter(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	respondTranslationError(ctx, translate.DLXTranslationResult{
+		Code:       http.StatusTooManyRequests,
+		Message:    "DeepL returned HTTP 429 (Too Many Requests)",
+		RetryAfter: "60",
+	})
+	if recorder.Code != http.StatusTooManyRequests || recorder.Header().Get("Retry-After") != "60" {
+		t.Fatalf("got HTTP %d with headers %v, want 429 with Retry-After 60", recorder.Code, recorder.Header())
+	}
+}
 
 // The `text` field of POST /translate accepts either shape; decoding uses the
 // same encoding/json decoder gin binds request bodies with.

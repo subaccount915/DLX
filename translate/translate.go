@@ -26,6 +26,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,30 +48,31 @@ import (
 // (appversion.go) so a DeepL release cannot silently invalidate the profile;
 // iosAppVersion below is only the fallback.
 //
-//   Transport
-//     ItaClient oneshot uses Ktor Darwin engine
-//     (io.ktor.client.engine.darwin.KtorNSURLSessionDelegate) → real
-//     URLSession TLS. We approximate that ClientHello with utls HelloIOS.
+//	Transport
+//	  ItaClient oneshot uses Ktor Darwin engine
+//	  (io.ktor.client.engine.darwin.KtorNSURLSessionDelegate) → real
+//	  URLSession TLS. DLX uses Go's default TLS, without legacy iOS emulation.
 //
-//   Free URL   → https://oneshot-free.www.deepl.com/v1/translate
-//   Pro URL    → https://oneshot. + <cell> + .pro.deepl.com/v1/translate
-//                (we keep oneshot-pro.www as the free-tier Pro fallback)
+//	Free URL   → https://oneshot-free.www.deepl.com/v1/translate
+//	Pro URL    → https://oneshot. + <cell> + .pro.deepl.com/v1/translate
+//	             (we keep oneshot-pro.www as the free-tier Pro fallback)
 //
-//   Headers (ClientInfos.appHeaders + LoginNone):
-//     Authorization: None          (ItaClient.LoginNone)
-//     x-app-os-version             (UIDevice.systemVersion)
-//     x-app-instance-id            (stable install UUID)
-//     x-app-session-id             (session UUID)
-//     User-Agent                   (URLSession / CFNetwork product form)
-//     Accept / Accept-Encoding     (URLSession defaults)
+//	Headers (ClientInfos.appHeaders + LoginNone):
+//	  Authorization: None          (ItaClient.LoginNone)
+//	  x-app-os-version             (UIDevice.systemVersion)
+//	  x-app-instance-id            (stable install UUID)
+//	  x-app-session-id             (session UUID)
+//	  User-Agent                   (URLSession / CFNetwork product form)
+//	  Accept / Accept-Encoding     (URLSession defaults)
 //
-//   Body (ItaClient OneShotTranslationRequestDto + AppInformation):
-//     text[], target_lang, source_lang?, usage_type, app_information
-//     usage_type ∈ {translate, ocr, voiceforconversations}
+//	Body (ItaClient OneShotTranslationRequestDto + AppInformation):
+//	  text[], target_lang, source_lang?, usage_type, app_information
+//	  usage_type ∈ {translate, ocr, voiceforconversations}
 //
-// DeepL rate-limits / temporarily bans clients whose TLS + UA + app_information
-// story is inconsistent (e.g. iOS TLS fingerprint + "iOS 27.0" in the UA when
-// 27 is not a shipping OS). Keep every field on one coherent iOS profile.
+// Keep the advertised app version consistent in headers and app_information.
+// Do not force the legacy uTLS iOS fingerprint: default TLS was validated
+// with the same payload in a controlled native comparison. A genuine upstream
+// rate limit can still occur and must be returned to the caller.
 const (
 	oneshotFreeEndpoint = "https://oneshot-free.www.deepl.com/v1/translate"
 	oneshotProEndpoint  = "https://oneshot-pro.www.deepl.com/v1/translate"
@@ -104,8 +106,9 @@ const (
 	// early to spare the upstream and give the caller a faster error.
 	maxFreeTextLength = 1500
 
-	// oneshotTimeout caps how long we wait on a single translate request.
-	oneshotTimeout = 20 * time.Second
+	// oneshotTimeout caps how long we wait for a translation, including retries.
+	oneshotTimeout    = 20 * time.Second
+	oneshotMaxRetries = 2
 
 	// warmupTimeout caps the initial GET to www.deepl.com that seeds the
 	// cookie jar. Cookies are best-effort; skip a slow warmup rather than
@@ -180,7 +183,7 @@ func newInstanceID() string {
 // regional default (en-US, pt-BR).
 var targetLangMap = map[string]string{
 	"AR": "ar", "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "DE-CH": "de-CH",
-	"EL": "el",
+	"EL":    "el",
 	"EN-GB": "en-GB", "EN-US": "en-US",
 	"ES": "es", "ES-419": "es-419", "ET": "et", "FI": "fi", "FR": "fr", "FR-CA": "fr-CA",
 	"HE": "he", "HU": "hu", "ID": "id", "IT": "it", "JA": "ja", "KO": "ko",
@@ -318,14 +321,16 @@ func getOneshotClient(proxyURL string) (*req.Client, error) {
 }
 
 func newOneshotClient(proxyURL string) (*req.Client, error) {
-	// Match ItaClient's Ktor Darwin / URLSession profile:
-	//   - TLS ClientHello ≈ real iOS (utls HelloIOS_Auto)
+	// Use the default TLS transport with normal certificate verification.
+	// SetTLSFingerprintIOS uses the dependency's legacy iOS 14 profile, which
+	// can receive persistent 429 even when the same request with default TLS
+	// succeeds. Keep the existing application-level request shape:
+	//   - app metadata consistent with the advertised User-Agent
 	//   - Cookie jar shared like URLSession's HTTPCookieStorage
 	//   - Common headers = what URLSession attaches by default
 	// Per-request headers (Authorization, User-Agent, x-app-*) are set in
 	// callOneshot; the client-level User-Agent is only a default.
 	client := req.C().
-		SetTLSFingerprintIOS().
 		SetCookieJar(sharedCookieJar()).
 		SetTimeout(oneshotTimeout).
 		SetUserAgent(iosUserAgent(iosAppVersion)).
@@ -357,16 +362,41 @@ func iosUserAgent(appVersion string) string {
 	)
 }
 
-// callOneshot POSTs to the oneshot endpoint and returns the parsed JSON.
+type oneshotResponse struct {
+	status     int
+	body       gjson.Result
+	retryAfter string
+}
+
+func (response oneshotResponse) rateLimitedResult(id int64) DLXTranslationResult {
+	message := "DeepL returned HTTP 429 (Too Many Requests)"
+	if gjson.Valid(response.body.Raw) {
+		for _, field := range [...]string{"detail", "message", "title", "error.message", "errors.0.message"} {
+			detail := strings.TrimSpace(response.body.Get(field).Str)
+			if detail != "" && len(detail) <= 512 {
+				message += ": " + detail
+				break
+			}
+		}
+	}
+	return DLXTranslationResult{
+		ID:         id,
+		Code:       http.StatusTooManyRequests,
+		Message:    message,
+		RetryAfter: response.retryAfter,
+	}
+}
+
+// callOneshot POSTs to the oneshot endpoint and returns its status and parsed JSON.
 // For anonymous traffic bearerToken is empty and we send the literal
 // header `Authorization: None` — matching ItaClient.LoginNone. Omitting
 // that header puts the request on a different server-side auth branch.
 // appVersion is the value the request body advertises; the same value is
 // echoed in the User-Agent so TLS, UA and app_information stay consistent.
-func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion string) (gjson.Result, int, error) {
+func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL, appVersion string) (oneshotResponse, error) {
 	client, err := getOneshotClient(proxyURL)
 	if err != nil {
-		return gjson.Result{}, 0, err
+		return oneshotResponse{}, err
 	}
 
 	// LoginNone → literal "None"; LoginPro/Free → "Bearer <access_token>".
@@ -375,24 +405,30 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion
 		authValue = "Bearer " + bearerToken
 	}
 
-	resp, err := client.R().
-		DisableAutoReadResponse().
-		SetHeader("Content-Type", "application/json").
-		SetHeader("Authorization", authValue).
-		SetHeader("User-Agent", iosUserAgent(appVersion)).
-		// ClientInfos.appHeaders (Util/ClientInfos.swift) — only these three
-		// x-app-* keys exist in the iOS binary.
-		SetHeader("x-app-os-version", iosOSVersion).
-		SetHeader("x-app-instance-id", instanceID).
-		SetHeader("x-app-session-id", sessionID).
-		SetBodyBytes(body). // pins Content-Length; an io.Reader would
-		// force Transfer-Encoding: chunked, which URLSession JSON bodies
-		// never emit.
-		Post(endpoint)
+	return retryOneshot(ctx, func(ctx context.Context) (oneshotResponse, error) {
+		request := client.R().
+			SetContext(ctx).
+			DisableAutoReadResponse().
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", authValue).
+			SetHeader("User-Agent", iosUserAgent(appVersion)).
+			// ClientInfos.appHeaders (Util/ClientInfos.swift) — only these three
+			// x-app-* keys exist in the iOS binary.
+			SetHeader("x-app-os-version", iosOSVersion).
+			SetHeader("x-app-instance-id", instanceID).
+			SetHeader("x-app-session-id", sessionID).
+			SetBodyBytes(body)
+		return postOneshot(request, endpoint)
+	})
+}
+
+func postOneshot(request *req.Request, endpoint string) (oneshotResponse, error) {
+	resp, err := request.Post(endpoint)
 	if err != nil {
-		return gjson.Result{}, 0, err
+		return oneshotResponse{}, err
 	}
 	defer resp.Body.Close()
+	response := oneshotResponse{status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
 
 	// Once we set Accept-Encoding ourselves, Go's HTTP stack stops
 	// transparently decompressing, so handle gzip/deflate/br by hand.
@@ -401,7 +437,7 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion
 	case "gzip":
 		gr, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reader: %w", err)
+			return response, fmt.Errorf("gzip reader: %w", err)
 		}
 		defer gr.Close()
 		reader = gr
@@ -410,11 +446,55 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion
 	case "br":
 		reader = brotli.NewReader(resp.Body)
 	}
+	if response.status == http.StatusTooManyRequests {
+		reader = io.LimitReader(reader, 16<<10)
+	}
 	raw, err := io.ReadAll(reader)
 	if err != nil {
-		return gjson.Result{}, resp.StatusCode, fmt.Errorf("read response body: %w", err)
+		return response, fmt.Errorf("read response body: %w", err)
 	}
-	return gjson.ParseBytes(raw), resp.StatusCode, nil
+	response.body = gjson.ParseBytes(raw)
+	return response, nil
+}
+
+func retryOneshot(ctx context.Context, post func(context.Context) (oneshotResponse, error)) (oneshotResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, oneshotTimeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	for retries := 0; ; retries++ {
+		if err := ctx.Err(); err != nil {
+			return oneshotResponse{}, err
+		}
+		response, err := post(ctx)
+		if response.status != http.StatusTooManyRequests {
+			return response, err
+		}
+		// A bare 429 can be a persistent rejection, not a short-lived limit.
+		// Retry only when the upstream supplies an explicit valid waiting period.
+		delay, retryable := oneshotRetryDelay(response.retryAfter, time.Now())
+		if !retryable || retries >= oneshotMaxRetries || delay >= time.Until(deadline) {
+			return response, nil
+		}
+		select {
+		case <-ctx.Done():
+			return response, nil
+		case <-time.After(delay):
+			if ctx.Err() != nil {
+				return response, nil
+			}
+		}
+	}
+}
+
+func oneshotRetryDelay(retryAfter string, now time.Time) (time.Duration, bool) {
+	if seconds, err := strconv.ParseUint(retryAfter, 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+		// Values beyond our budget need not fit time.Duration: they prevent retries.
+		return time.Duration(min(seconds, uint64(oneshotTimeout/time.Second))) * time.Second, true
+	}
+	if date, err := http.ParseTime(retryAfter); err == nil {
+		return max(date.Sub(now), 0), true
+	}
+	return 0, false
 }
 
 // textLength returns the length of text in UTF-16 code units — the unit
@@ -495,6 +575,11 @@ func translationsFromResult(result gjson.Result, count int) ([]string, error) {
 // to the Pro endpoint; the value is sent verbatim as the Bearer token (i.e.
 // it must be an OAuth access token, not the legacy dl_session cookie).
 func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling string, proxyURL string, dlSession string) (DLXTranslationResult, error) {
+	return TranslateByDLXContext(context.Background(), sourceLang, targetLang, texts, tagHandling, proxyURL, dlSession)
+}
+
+// TranslateByDLXContext translates texts and observes cancellation during the upstream request.
+func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang string, texts []string, tagHandling string, proxyURL string, dlSession string) (DLXTranslationResult, error) {
 	// oneshot charges its anonymous cap against the total length of the
 	// `text` array, and a batch is one upstream request, so the cap applies
 	// to the sum of the texts that are actually sent.
@@ -577,7 +662,10 @@ func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling s
 	}
 
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, proxyURL, appVersion)
+	response, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL, appVersion)
+	if response.status == http.StatusTooManyRequests {
+		return response.rateLimitedResult(id), nil
+	}
 	if err != nil {
 		// Map upstream timeouts to 504 so callers can distinguish "DeepL
 		// took too long" from other 503 failure modes (DNS, TLS, etc.).
@@ -596,15 +684,10 @@ func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling s
 		}, nil
 	}
 
-	switch status {
+	result := response.body
+	switch response.status {
 	case http.StatusOK:
 		// fall through to body parsing
-	case http.StatusTooManyRequests:
-		return DLXTranslationResult{
-			ID:      id,
-			Code:    http.StatusTooManyRequests,
-			Message: "too many requests, your IP has been blocked by DeepL temporarily, please don't request it frequently in a short time",
-		}, nil
 	case http.StatusForbidden:
 		// iOS surfaces this as OneShot: Forbidden / AuthenticationFailed /
 		// OutdatedClient / UserBlocked depending on body; collapse to 403.
@@ -624,7 +707,7 @@ func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling s
 		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
-			Message: fmt.Sprintf("request failed with status code: %d", status),
+			Message: fmt.Sprintf("request failed with status code: %d", response.status),
 		}, nil
 	}
 

@@ -93,6 +93,16 @@ Batch limits and failure modes:
 - A blank text — empty, or nothing but whitespace — is answered with itself and never sent, so a blank line in a segmented document keeps its place instead of failing the request. `"text": []` is answered with `{"data": []}`; a body with no `text` field at all, or `"text": null`, is rejected with `400 {"code":400,"message":"Invalid request payload"}`.
 - A batch is all-or-nothing: if DeepL returns a different number of translations or leaves one of them empty, the request fails with `503 {"code":503,"message":"Translation failed"}` instead of answering with placeholders or a shorter, misaligned array.
 
+## HTTP 429 troubleshooting
+
+The default transport uses Go TLS with normal certificate verification. The previous forced iOS TLS fingerprint was reproduced returning 429 while the same request with default TLS returned a correct translation. See the linked investigation for native and Docker validation.
+
+A 429 means the upstream declined the request; it does not by itself prove an IP ban. DLX returns the upstream error detail when available and forwards `Retry-After`. Docker and native builds use the same translation client, so switching packaging does not guarantee recovery.
+
+The client retries only when upstream supplies a valid `Retry-After` that fits the request deadline, with at most two retries. Missing or malformed `Retry-After` returns 429 immediately without additional translation attempts. Do not run a tight retry loop around persistent 429 responses. Transport errors after a retry remain transport errors instead of being reported as an earlier 429.
+
+Historical stale iOS app-version failures were addressed by runtime App Store lookup; that lookup can fall back if Apple is unreachable. A current app version still does not guarantee acceptance by the unofficial upstream endpoint. See [the local native/Docker investigation](docs/deeplx-429-investigation.md) for tested versions, results, and limitations.
+
 ## Discussion Group
 [Telegram Group](https://t.me/+8KDGHKJCxEVkNzll)
 

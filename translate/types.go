@@ -24,6 +24,7 @@ type DLXTranslationResult struct {
 	Code         int      `json:"code"`
 	ID           int64    `json:"id"`
 	Message      string   `json:"message,omitempty"`
+	RetryAfter   string   `json:"-"`
 	Data         []string `json:"data"`
 	Alternatives []string `json:"alternatives"`
 	SourceLang   string   `json:"source_lang"`
