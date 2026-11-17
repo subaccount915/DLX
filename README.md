@@ -11,6 +11,8 @@
 
 # DLX
 
+This independent copy keeps unchanged upstream history on `master` and user changes on [`custom`](https://github.com/subaccount915/DLX/tree/custom). Use `custom` for development, pull requests, and custom builds. See [repository workflow](docs/github-sync.md).
+
 [![GitHub Workflow][1]](https://github.com/OwO-Network/DLX/actions)
 [![Go Version][2]](https://github.com/OwO-Network/DLX/blob/main/go.mod)
 [![Go Report][3]](https://goreportcard.com/badge/github.com/OwO-Network/DLX)
