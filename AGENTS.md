@@ -9,3 +9,5 @@ This is an independent copy managed by the github-sync skill.
 - See `docs/github-sync.md` for migration provenance and CI/release conventions.
 - Preserve the default Go TLS transport and conservative Retry-After handling. Run `go test ./...` for translation changes and distinguish live verification from mocks.
 - No automatic release, image publication, visibility change, or scheduled sync is implied by a normal source update.
+
+- This installation uses the native macOS binary. Do not reintroduce Docker CI, image builds, or a container runtime requirement unless requested.

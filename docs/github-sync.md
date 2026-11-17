@@ -19,6 +19,6 @@ Fetch upstream and origin, pin the new source SHA, and verify that the existing 
 
 ## CI and publication
 
-CI and Docker validation run on custom pushes and pull requests targeting custom. Docker jobs perform builds only; image publication is not configured by this migration. User release tags use `custom-v*` and verify that the tagged commit belongs to custom history. Original upstream `v*` tags are preserved as history and are not republished as user releases. Upstream workflows remain untouched on master.
+Use the native macOS binary for this customized installation. CI continues to build and test source on custom pushes and pull requests targeting custom. The custom Docker workflow has been removed; no Docker image build or publication is configured. Upstream Dockerfile and compose examples are retained for reference. User release tags use `custom-v*` and verify that the tagged commit belongs to custom history. Original upstream `v*` tags are preserved as history and are not republished as user releases. Upstream workflows remain untouched on master.
 
 The original fork remains the backup for repository metadata; Git history transfer does not migrate issues, PRs, Actions logs/secrets, or release assets. No GitHub releases or issues existed in that fork at inspection. Source licenses and copyright notices are preserved.

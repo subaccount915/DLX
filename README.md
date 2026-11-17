@@ -40,6 +40,19 @@ DLX is a self-hosted translation API server written in Go. It exposes a simple H
 
 ## Usage
 
+### macOS (custom branch)
+
+This customized installation uses the native macOS binary, without Docker.
+Build with the Go version required by `go.mod` and run locally:
+
+```bash
+git switch custom
+go build -o dlx .
+./dlx -ip 127.0.0.1 -port 1188
+```
+
+Use `http://127.0.0.1:1188/translate` for translation requests. Docker CI is disabled on `custom`; the original Docker examples below are retained as upstream reference and published upstream images do not contain this branch's fixes.
+
 ### Docker
 
 Docker Hub and GHCR image names remain `deeplx` (only the GitHub repository was renamed to DLX):
